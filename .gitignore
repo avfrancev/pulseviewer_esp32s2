@@ -1,0 +1,4 @@
+build
+components/arduino
+managed_components
+sdkconfig.old
