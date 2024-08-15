@@ -237,7 +237,7 @@ public:
   hw_timer_t* timer = nullptr;
 
   void init() {
-    // loadConfig();
+    loadConfig();
     printPumpSettings();
     pinMode(pin_, OUTPUT);
     eventGroup = xEventGroupCreateStatic(&eventGroupBuffer_);

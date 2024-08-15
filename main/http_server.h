@@ -409,7 +409,13 @@ void ws_broadcast(uint8_t *data, size_t len) {
 
 int count = 0;
 
+#include "WiFi.h"
+
 static void ws_broadcast_buf( uint8_t *buf, size_t len) {
+    if (WiFi.status() != WL_CONNECTED) {
+      ESP_LOGE(TAG_HTTP, "ws_broadcast_buf: Not connected to WiFi");
+      return;
+    }
     static const size_t max_clients = 8;
     size_t clients = max_clients;
     int    client_fds[max_clients];

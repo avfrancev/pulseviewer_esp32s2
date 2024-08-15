@@ -64,8 +64,9 @@ extern "C" void app_main()
 
   esp_log_level_set("*", ESP_LOG_INFO);
   esp_log_level_set("gpio", ESP_LOG_WARN);
+  esp_log_level_set("gpio", ESP_LOG_WARN);
   esp_log_level_set(TAG, ESP_LOG_DEBUG);
-  // esp_log_level_set("PUMP", ESP_LOG_DEBUG);
+  esp_log_level_set("PUMP", ESP_LOG_DEBUG);
 
   ESP_LOGW(TAG, "Starting...");
   
@@ -84,8 +85,7 @@ extern "C" void app_main()
   //   ESP_LOGI("CC1101", "OK");
 
   // }
-  setup_wifi();
-  start_webserver();
+
 
   initRadio();
 
@@ -123,7 +123,9 @@ extern "C" void app_main()
         break;
     }
   });
-  
+
+  setup_wifi();
+  start_webserver();
   // vTaskDelay(5000 / portTICK_PERIOD_MS);
 
 }

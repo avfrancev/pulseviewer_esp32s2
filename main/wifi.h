@@ -18,13 +18,18 @@ WiFiMulti wifiMulti;
 //   }
 // });
 const char *TAG_WIFI = "WIFI";
+
+void setup_wifi();
+
 void WiFiEvents(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      // ESP_LOGI(TAG_WIFI, "connected to %s! IP address: " IPSTR, WiFi.SSID().c_str(), IP2STR(WiFi.localIP().u_addr.ip4.addr));
+      ESP_LOGW(TAG_WIFI, "Connected!");
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      ESP_LOGI(TAG_WIFI, "disconnected!");
+      ESP_LOGW(TAG_WIFI, "Disconnected!");
+      WiFi.removeEvent(WiFiEvents);
+      setup_wifi();
       break;
     default:
       break;
@@ -33,15 +38,19 @@ void WiFiEvents(WiFiEvent_t event) {
 
 static void wifi_task( void *pvParameters ) {
   ESP_LOGI(TAG_WIFI, "Starting...");
-
-  WiFi.onEvent(WiFiEvents);
+  
+  WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_MODE_STA);
-  WiFi.enableLongRange(true);
-  WiFi.printDiag(Serial);
-  // WiFi.begin(ssid, password);
+  WiFi.useStaticBuffers(true);
+  WiFi.disconnect();
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
   wifiMulti.addAP("M3", "123qwe123");
   wifiMulti.addAP("zxlwrt", "123qwe123");
+  wifiMulti.addAP("BEE_465CM", "123qwe123");
+  wifiMulti.addAP("BEE_465C", "123qwe123");
+
   wifiMulti.run();
+  WiFi.onEvent(WiFiEvents);
 
   vTaskDelete(NULL);
 }

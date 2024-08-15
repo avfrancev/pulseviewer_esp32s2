@@ -1,0 +1,5 @@
+{
+  "idle_time": 5000,
+  "liters_per_minute": 44.0,
+  "max_off_time_ms": 600000
+}
