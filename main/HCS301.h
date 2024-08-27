@@ -26,10 +26,7 @@ struct __attribute__((packed)) HCS301_t
 
   HCS301_t() : preamble(0), encrypted(0), serial(0), buttons(0), vlow(0), fixed(0) {}
 
-  // HCS301_t(const uint8_t *d)
-  // {
-  //   this->update(d);
-  // }
+  bool is_valid() const { return preamble == 0xfff; }
 
   void update(const uint8_t *d)
   {
@@ -39,14 +36,7 @@ struct __attribute__((packed)) HCS301_t
     this->buttons = (d[9] >> 4) & 0xf;
     this->vlow = (d[9] >> 3) & 0x1;
     this->fixed = (d[9] >> 2) & 0x1;
-    // Serial.printf("fixed: %d vlow: %d buttons: %d serial: %08X encrypted: %08X preamble: %04X\n", fixed, vlow, buttons, serial, encrypted, preamble);
   }
-
-  bool is_valid() const { return preamble == 0xfff; }
-
-  // bool is_serial(uint32_t serial) const { return this->serial == serial; }
-
-  // explicit operator bool() const { return crc_ok; }
 };
 
 
@@ -54,6 +44,11 @@ class HCS301 : public PWMDecoder {
 public:
   EventGroupHandle_t eventGroup;
 
+  /**
+   * @brief Construct a new HCS301 object.
+   *
+   * @param serial a 28-bit serial number
+   */
   HCS301(uint32_t serial = 0) {
     serial_ = serial;
     data_ = HCS301_t();
@@ -61,23 +56,14 @@ public:
     xTaskCreate(task_event_handler, "HCS301 event handler", 4*1024, this, 3, NULL);
   }
 
-  void set_on_buttons_press(std::function<void(EventBits_t)> cb) {
-    on_buttons_press_ = cb;
-  }
-
-  void decode_pwm(pwm_message_t *pwm_msg, rmt_message_t *rmt_msg) override {
-    if (rmt_msg->length != 78) {
-      return;
-    }
-    data_.update(pwm_msg->buf);
-    // Serial.printf("HCS301: data_.serial = %08X; serial_ = %08X\n", data_.serial, serial_);
-    if (data_.is_valid() && data_.serial == serial_ && data_.encrypted != last_encripted_) {
-      // Serial.printf("HCS301: PWM decoder get %d bytes with rssi %d\n", pwm_msg->length, rmt_msg->rssi);
-      xEventGroupSetBits(eventGroup, data_.buttons);
-      last_encripted_ = data_.encrypted;
-    }
-  }
-
+  /**
+   * @brief Event handler task for HCS301 class.
+   *
+   * Waits for bits in eventGroup to be set and calls on_buttons_press_
+   * callback with the set bits.
+   *
+   * @param args pointer to HCS301 object
+   */
   static void task_event_handler(void *args) {
     HCS301 *this_ = (HCS301 *)args;
     EventBits_t uxBits;
@@ -90,6 +76,42 @@ public:
     vTaskDelete(NULL);
   }
 
+  /**
+   * @brief Set a callback for button press events.
+   *
+   * The callback will be called with the set bits in the eventGroup as
+   * argument when a new set of buttons is detected.
+   *
+   * @param cb a std::function<void(EventBits_t)> callback
+   */
+  void set_on_buttons_press(std::function<void(EventBits_t)> cb) {
+    on_buttons_press_ = cb;
+  }
+
+  /**
+   * @brief Decode the given PWM message and trigger button press events
+   *
+   * @param pwm_msg The PWM message to decode
+   * @param rmt_msg The RMT message that was decoded into pwm_msg
+   *
+   * This function decodes the given PWM message and checks if it is a valid
+   * message for the given serial number and if the encrypted value has changed.
+   * If so, it triggers the button press event by setting the corresponding
+   * bits in the eventGroup.
+   */
+  void decode_pwm(pwm_message_t *pwm_msg, rmt_message_t *rmt_msg) override {
+    if (rmt_msg->length != 78) {
+      return;
+    }
+    data_.update(pwm_msg->buf);
+    if (data_.is_valid() && data_.serial == serial_ && data_.encrypted != last_encripted_) {
+      xEventGroupSetBits(eventGroup, data_.buttons);
+      last_encripted_ = data_.encrypted;
+    }
+  }
+
+
+
 private:
   std::function<void(EventBits_t)> on_buttons_press_;
   HCS301_t data_;
@@ -97,5 +119,3 @@ private:
   uint32_t last_encripted_ = 0;
   StaticEventGroup_t eventGroupBuffer_;
 };
-
-

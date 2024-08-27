@@ -64,7 +64,6 @@ extern "C" void app_main()
 
   esp_log_level_set("*", ESP_LOG_INFO);
   esp_log_level_set("gpio", ESP_LOG_WARN);
-  esp_log_level_set("gpio", ESP_LOG_WARN);
   esp_log_level_set(TAG, ESP_LOG_DEBUG);
   esp_log_level_set("PUMP", ESP_LOG_DEBUG);
 
@@ -79,21 +78,10 @@ extern "C" void app_main()
 
   setup_SPIFFS();
 
-  // if (!setup_CC1101()) {
-  //   ESP_LOGE("TAG#1", "Failed to initialize CC1101");
-  // } else {
-  //   ESP_LOGI("CC1101", "OK");
-
-  // }
-
-
   initRadio();
 
   pump->init();
-  // pump->loadConfig();
   
-  // pump->printPumpSettings();
-
   hcs301->set_on_buttons_press([](EventBits_t button) {
     ESP_LOGD(TAG, "HCS301: Pressed button: %d", (int)button);
     switch (button) {
@@ -103,7 +91,6 @@ extern "C" void app_main()
         ESP.restart();
         break;
       case 4:
-        // ESP_LOGD(TAG, "GET STATE: %d", (int)pump->state);
         pump->stop();
         break;
       case 2:
@@ -112,20 +99,12 @@ extern "C" void app_main()
           break;
         }
         pump->startByLiters(5*4);
-        // pump->addTime(pump->getPumpSettings().max_off_time_ms);
         break;
       case 9:
-        // if (pump->getState() == Pump::State::OFF) {
-        //   pump->addCapacityLiters(5*1);
-        // } else {
-        //   pump->addCapacityLiters(5);
-        // }
         break;
     }
   });
 
   setup_wifi();
   start_webserver();
-  // vTaskDelay(5000 / portTICK_PERIOD_MS);
-
 }
