@@ -11,9 +11,9 @@
 
 
 #define TAG_RADIO "RADIO"
-// size_t rx_num_symbols = RMT_MEM_NUM_BLOCKS_4 * RMT_SYMBOLS_PER_CHANNEL_BLOCK;
-// rmt_data_t rx_symbols[RMT_MEM_NUM_BLOCKS_4 * RMT_SYMBOLS_PER_CHANNEL_BLOCK];
 QueueHandle_t rmt_parse_queue;
+QueueHandle_t receive_queue;
+
 bool setup_CC1101()
 {
 
@@ -31,50 +31,61 @@ bool setup_CC1101()
   return true;
 }
 
-
-
 static void rmt_parse_task(void *pvParameters) {
   rmt_message_t msg;
   while (1)
   {
-    if (xQueueReceive(rmt_parse_queue, &msg, portMAX_DELAY) == pdTRUE)
-    {
-      // Serial.printf("Got %d RMT Symbols with RSSI %d [ uxQueueSpacesAvailable: %d ]\n", msg.length, msg.rssi, uxQueueSpacesAvailable(rmt_parse_queue));
-      // decodePWM(&msg);
-      // msg.
+    if (xQueueReceive(rmt_parse_queue, &msg, portMAX_DELAY) == pdTRUE) {
       PWMDecoder::decode(&msg);
       if (msg.length < 2) continue;
-      // Serial.printf("Got %d RMT Symbols with RSSI %d\n", msg.length, msg.rssi);
-      // ws_broadcast((uint8_t *)&msg.buf, msg.length*4);
-      
-      // Serial.printf("sizeof(struct rmt_message_t) %d\n", sizeof(struct rmt_message_t));
-      // Serial.printf("sizeof(msg) %d\n", sizeof(msg));
-      // Serial.printf(" %d / %ld / %d\n", msg.length, msg.delta, msg.rssi);
-      // Serial.printf(" %d / %ld / %d\n", sizeof(msg.length), sizeof(msg.delta), sizeof(msg.rssi));
-      // Serial.printf("offset time: %ld\n", (long)offsetof(struct rmt_message_t, time));
-      // Serial.printf("offset delta: %ld\n", (long)offsetof(struct rmt_message_t, delta));
-      // Serial.printf("offset rssi: %ld\n", (long)offsetof(struct rmt_message_t, rssi));
-      // Serial.printf("offset buf: %ld\n", (long)offsetof(struct rmt_message_t, buf));
       uint8_t *bytePtr = (uint8_t*)&msg;
       ws_broadcast(bytePtr, sizeof(msg));
-      // ws_broadcast((uint8_t *)&msg, sizeof(msg));
     }
   }
   vTaskDelete(NULL);
 }
-QueueHandle_t receive_queue;
 
-static bool example_rmt_rx_done_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *user_data)
+/**
+ * @brief This function is a callback for the RMT driver which is invoked when a RX is done.
+ * Also, it sends the received data to the rmt_parse_task for decoding.
+ *
+ * @param channel The RMT channel which has received the data.
+ * @param edata Pointer to the RX done event data.
+ * @param user_data Pointer to a `QueueHandle_t` which is the queue to send the data to.
+ *
+ * @return `true` if a higher priority task was woken by this function, `false` otherwise.
+ */
+static bool rmt_rx_done_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *user_data)
 {
     BaseType_t high_task_wakeup = pdFALSE;
     QueueHandle_t receive_queue = (QueueHandle_t)user_data;
-    // send the received RMT symbols to the parser task
     xQueueSendFromISR(receive_queue, edata, &high_task_wakeup);
     return high_task_wakeup == pdTRUE;
 }
 
+/**
+ * @brief This is the task that receives RMT symbols over the RX channel and
+ * passes them to the rmt_parse_task for decoding.
+ *
+ * @param pvParameters unused
+ *
+ * This function creates an RMT RX channel and registers an on_recv_done callback
+ * that passes received symbols to the rmt_parse_task for decoding. The timing
+ * range is set to meet the NEC protocol specification. 
+ *
+ * The function runs in an infinite loop, waiting for RMT symbols to be received.
+ * Once symbols are received, it checks if the number of symbols is less than or
+ * equal to 3. If so, it discards the symbols and continues to wait for more. If
+ * the number of symbols is greater than 3, it creates a message with the RSSI,
+ * the length of the symbols, the time the symbols were received, and the time
+ * difference between the start of reception and the current time. It then sends
+ * the message to the rmt_parse_task for decoding.
+ *
+ * This function should be run in a task with a high priority to ensure that
+ * received symbols are processed as quickly as possible.
+ */
 static void rmt_recive_task(void *pvParameters) {
-  // ESP_LOGD(TAG, "create RMT RX channel");
+  ESP_LOGD(TAG_RADIO, "create RMT RX channel");
   rmt_rx_channel_config_t rx_channel_cfg = {
       .gpio_num = (gpio_num_t)CC1101_gdo2,
       .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -84,12 +95,12 @@ static void rmt_recive_task(void *pvParameters) {
   rmt_channel_handle_t rx_channel = NULL;
   ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_channel_cfg, &rx_channel));
 
-  // ESP_LOGD(TAG, "register RX done callback");
+  ESP_LOGD(TAG_RADIO, "register RX done callback");
   QueueHandle_t receive_queue = xQueueCreate(3, sizeof(rmt_rx_done_event_data_t));
   assert(receive_queue);
 
   rmt_rx_event_callbacks_t cbs = {
-      .on_recv_done = example_rmt_rx_done_callback,
+      .on_recv_done = rmt_rx_done_callback,
   };
   ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_channel, &cbs, receive_queue));
 
@@ -111,7 +122,6 @@ static void rmt_recive_task(void *pvParameters) {
     time_start = esp_timer_get_time() - delta;
 
     if (xQueueReceive(receive_queue, &rx_data, portMAX_DELAY) == pdPASS) {
-      // Serial.printf("Got %d RMT Symbols\n", rx_data.num_symbols);
 
       int64_t now = esp_timer_get_time();
       delta = now - time_start;
@@ -127,7 +137,6 @@ static void rmt_recive_task(void *pvParameters) {
       message.time = millis();
       message.delta = delta;
       memcpy(message.buf, rx_data.received_symbols, rx_data.num_symbols * 4);
-      // Serial.printf("Got %d symbols, RSSI: %d, delta: %ld\n", message.length, message.rssi, delta);
       ESP_LOGD(TAG_RADIO, "Got %d symbols, RSSI: %d, delta: %lld", message.length, message.rssi, delta);
 
       xQueueSend(rmt_parse_queue, &message, 0);
@@ -149,8 +158,7 @@ static void initRadio()
     return;
   }  
   xTaskCreate(rmt_recive_task, "rmt_recive_task", 1024 * 8, NULL, 6, NULL);
-
   xTaskCreate(rmt_parse_task, "rmt_parse_task", 1024 * 8, NULL, 1, NULL);
-
   ESP_LOGD(TAG_RADIO, "OK");
 }
+

@@ -4,6 +4,9 @@
 #include "esp_spiffs.h"
 #include <esp_http_server.h>
 #include "mbedtls/base64.h"
+#include "freertos/message_buffer.h"
+#include "WiFi.h"
+
 
 #include "main.h"
 #include "pump.h"
@@ -13,6 +16,16 @@
 #define FILE_PATH_MAX (128 + 128)
 #define SCRATCH_BUFSIZE (10240)
 
+char chunk[1024] = { 0 };
+
+httpd_handle_t server = NULL;
+
+struct async_resp_arg {
+    httpd_handle_t hd;
+    int fd;
+};
+
+static MessageBufferHandle_t wsMeassageBufferHandle = NULL;
 
 static inline bool file_exist(const char *path)
 {
@@ -56,11 +69,20 @@ static esp_err_t set_content_type_from_file(httpd_req_t *req, const char *filepa
     return httpd_resp_set_type(req, type);
 }
 
-char chunk[1024] = { 0 };
 
 
-
-
+/**
+ * Sends a file in chunks as an HTTP response.
+ *
+ * @param req The HTTP request object.
+ * @param filepath The path to the file to be sent.
+ * @return ESP_OK if the file was sent successfully, ESP_FAIL otherwise.
+ *
+ * This function opens the file specified by `filepath`, reads it in chunks, and sends each chunk as an HTTP response.
+ * The MIME type of the file is determined by its extension using the `set_content_type_from_file` function.
+ * If an error occurs while reading the file or sending the response, an error message is logged and the function
+ * returns ESP_FAIL.
+ */
 static esp_err_t send_file(httpd_req_t *req, const char* filepath)
 {
     int fd = open(filepath, O_RDONLY, 0);
@@ -97,13 +119,23 @@ static esp_err_t send_file(httpd_req_t *req, const char* filepath)
     } while (read_bytes > 0);
 
     close(fd);
-    // Serial.println("File sending complete");
     ESP_LOGD(TAG_HTTP, "File sent: %s", filepath);
     /* Respond with an empty chunk to signal HTTP response completion */
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
+/**
+ * HTTP GET handler for common REST requests.
+ *
+ * @param req The HTTP request object.
+ * @return ESP_OK if the file was sent successfully, ESP_FAIL otherwise.
+ *
+ * This function tries to find the requested file in two locations: the original
+ * location (i.e., filepath) and the location with the ".gz" extension. If the file
+ * is found, it is sent as an HTTP response using the send_file function. If not,
+ * the "index.html.gz" file is sent.
+ */
 static esp_err_t rest_common_get_handler(httpd_req_t *req)
 {
   const char* uri = req->uri;
@@ -126,6 +158,24 @@ static esp_err_t rest_common_get_handler(httpd_req_t *req)
   return send_file(req, filepath);
 }
 
+/**
+ * @brief Retrieve JSON data from an HTTP request
+ * 
+ * This function retrieves JSON data from an HTTP request. It first checks
+ * if the request content type is "application/json" by calling 
+ * httpd_req_get_hdr_value_str and comparing the result with "application/json".
+ * If the content type is correct, it receives the data from the request using
+ * httpd_req_recv. The received data is then parsed into a cJSON object using
+ * cJSON_Parse. If parsing is successful, the cJSON object is assigned to the
+ * pointer pointed to by the second argument and ESP_OK is returned. If parsing
+ * fails, ESP_FAIL is returned. If the request content type is not "application/json",
+ * ESP_FAIL is returned.
+ * 
+ * @param req The HTTP request object
+ * @param json A pointer to a pointer to a cJSON object where the parsed JSON
+ *             object will be stored.
+ * @return esp_err_t ESP_OK if parsing is successful, ESP_FAIL otherwise.
+ */
 esp_err_t httpd_get_JSON(httpd_req_t *req, cJSON** json) {
   char content_type[32] = {0};
   httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type));
@@ -148,9 +198,21 @@ esp_err_t httpd_get_JSON(httpd_req_t *req, cJSON** json) {
   return ESP_FAIL;
 }
 
+/**
+ * @brief Handle POST request to /pump_config. Set new pump configuration and
+ *        save it to file.
+ * 
+ * This function handles POST requests to /pump_config. It first attempts to
+ * parse the request body as JSON using httpd_get_JSON. If parsing is
+ * successful, it calls pump->setPumpConfig with the parsed JSON object and
+ * then sends the file /spiffs/pump_config.json as the response. If parsing fails,
+ * a 500 Internal Server Error is returned.
+ * 
+ * @param req The HTTP request object
+ * @return esp_err_t ESP_FAIL if parsing fails, ESP_OK otherwise.
+ */
 static esp_err_t pump_config_post_handler(httpd_req_t *req)
 {
-  // use httpd_req_get_hdr_value_str(httpd_req_t *r, const char *field, char *val, size_t val_size) get content type if json
   cJSON* json = nullptr;
   if (httpd_get_JSON(req, &json) == ESP_OK) {
     Serial.println(cJSON_Print(json));
@@ -166,11 +228,21 @@ static esp_err_t pump_config_post_handler(httpd_req_t *req)
 }
 
 
-// static esp_err_t register_uri_handler(httpd_handle_t server, const char* uri, httpd_method_t method, esp_err_t handler)
-// static esp_err_t handler_wrapper(httpd_req_t *req, esp_err_t (*handler)(httpd_req_t *req)) {
-//   // *handler(req);
-// }
 
+/**
+ * @brief Register a URI handler for the given method and URI.
+ *
+ * This function registers a URI handler for the given method and URI. The
+ * handler_wrapper function is used to set the necessary headers for CORS and
+ * then calls the actual handler function. The handler function is stored in
+ * the user_ctx field of the httpd_uri_t struct.
+ *
+ * @param server The HTTP server handle.
+ * @param uri The URI to register the handler for.
+ * @param method The HTTP method to register the handler for.
+ * @param handler The handler function to register.
+ * @return esp_err_t ESP_OK on success, ESP_FAIL on error.
+ */
 static esp_err_t register_uri_handler(httpd_handle_t server, const char* uri, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *req))
 {
   auto handler_wrapper = [] (httpd_req_t *req) {
@@ -189,135 +261,18 @@ static esp_err_t register_uri_handler(httpd_handle_t server, const char* uri, ht
   return httpd_register_uri_handler(server, &new_uri);
 }
 
-// // implement class, that takes freertos queue. It must register consumers callbacks. On queue recive it must send it to callbacks
-// QueueHandle_t queue;
-// struct item_t {
-//   int values[10];
-//   int len;
-// } item_t;
-
-// class QueueConsumer {
-// public:
-//   QueueConsumer(QueueHandle_t queue) : queue_(queue) {}
-
-//   void registerConsumer(void (*consumer)(void *)) {
-//     consumers_.push_back(consumer);
-//   }
-
-//   void start() {
-//     xTaskCreate(task, "queueConsumer", 2048, this, 1, &task_handle_);
-//   }
-
-//   void stop() {
-//     vTaskDelete(task_handle_);
-//   }
-
-// private:
-//   static void task(void *arg) {
-//     QueueConsumer *self = (QueueConsumer *)arg;
-
-//     void* item;
-//     while (xQueueReceive(self->queue_, &item, portMAX_DELAY) == pdPASS) {
-//       // cast to item_t
-//       item_t *item_ptr = (item_t *)item;
-//       Serial.printf("received item: %d\n", item_ptr->len);
-//       for (auto consumer : self->consumers_) {
-//         consumer(item);
-//       }
-//     }
-//     vTaskDelete(NULL);
-//   }
-
-//   QueueHandle_t queue_;
-//   std::vector<void (*)(void *)> consumers_;
-//   TaskHandle_t task_handle_;
-// };
-
-
-
-
-// static void testQueueProducerTask(void *pvParameters) {
-//   item_t item = {
-//     .values = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-//     .len = 10
-//   };
-
-//   for(;;) {
-//     Serial.printf("sending item: %d\n", item.len);
-//     xQueueSend(queue, &item, portMAX_DELAY);
-//     Serial.printf("sent item: %d\n", item.len);
-//     vTaskDelay(1000 / portTICK_PERIOD_MS);
-//     // xQueueSend(queue, &queue, portMAX_DELAY);
-//   }
-//   vTaskDelete(NULL);
-// }
-// static void testQueueConsumer() {
-//   queue = xQueueCreate(2, sizeof(&item_t));
-//   QueueConsumer *consumer = new QueueConsumer(queue);
-//   // consumer->registerConsumer([] (void *item) {
-//   //   Serial.printf("got item: %d\n", (int)item);
-//   // });
-//   // consumer->registerConsumer([] (void *item) {
-//   //   // cast item to item_t
-//   //   item_t *item_ptr = (item_t *)item;
-//   //   Serial.printf("got!!!! item: %d\n", 111);
-//   // });
-//   consumer->start();
-//   xTaskCreate(testQueueProducerTask, "testQueueConsumer", 2048, NULL, 1, NULL);
-// }
-
 
 /**
- * Handler function for Server-Sent Events (SSE) request.
- * This function sets the content type to text/event-stream and sends an
- * initial retry delay of 1000ms. Then it enters an infinite loop waiting
- * for task notifications. When a notification is received, it sends a
- * data message to the client with an empty payload. The empty payload is
- * required by the SSE spec.
+ * @brief Send a WebSocket frame asynchronously.
  *
- * The function is registered to handle requests to the URI "/events".
- */
-static esp_err_t sse_handler(httpd_req_t *req)
-{
-  /**
-   * Set the content type of the response to text/event-stream. This tells
-   * the client that the response is an SSE stream.
-   */
-  httpd_resp_set_type(req, "text/event-stream");
-
-  /**
-   * Send an initial retry delay of 1000ms to the client. This tells the
-   * client how long to wait before retrying if there is no data available.
-   */
-  httpd_resp_sendstr_chunk(req, "retry: 1000\n\n");
-
-  /**
-   * Create a task to handle SSE requests. The task will block indefinitely
-   * waiting for task notifications. When a notification is received, it
-   * will send a data message to the client with an empty payload.
-   */
-  // TaskData *task_data = new TaskData();
-  // task_data->req = req;
-  // xTaskCreatePinnedToCore(sse_task, "sse_task", 2048, task_data, 1, NULL, 0);
-
-  /**
-   * Return ESP_OK to indicate that the request was handled successfully.
-   */
-  return ESP_OK;
-}
-
-////////////////////////////////////////
-// #include "keep_alive.h"
-
-httpd_handle_t server = NULL;
-
-struct async_resp_arg {
-    httpd_handle_t hd;
-    int fd;
-};
-
-/*
- * async send function, which we put into the httpd work queue
+ * This function is a callback function for sending a WebSocket frame
+ * asynchronously. It takes a void pointer to an argument struct
+ * `async_resp_arg`, which contains the HTTP server handle `hd` and
+ * the file descriptor `fd`. It sends a WebSocket text frame with the
+ * payload "Async data" to the client. After sending the frame, it
+ * frees the argument struct.
+ *
+ * @param arg A void pointer to an argument struct `async_resp_arg`.
  */
 static void ws_async_send(void *arg)
 {
@@ -330,14 +285,12 @@ static void ws_async_send(void *arg)
     ws_pkt.payload = (uint8_t*)data;
     ws_pkt.len = strlen(data);
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-
     httpd_ws_send_frame_async(hd, fd, &ws_pkt);
     free(resp_arg);
 }
 
 static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req)
 {
-    // struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
     struct async_resp_arg *resp_arg = new async_resp_arg;
     resp_arg->hd = req->handle;
     resp_arg->fd = httpd_req_to_sockfd(req);
@@ -347,9 +300,7 @@ static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req)
 
 static esp_err_t echo_handler(httpd_req_t *req)
 {
-  // return ESP_OK;
     if (req->method == HTTP_GET) {
-        // Serial.printf("Handshake done, the new connection was opened\n");
         return ESP_OK;
     }
     httpd_ws_frame_t ws_pkt;
@@ -359,15 +310,12 @@ static esp_err_t echo_handler(httpd_req_t *req)
     /* Set max_len = 0 to get the frame len */
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
-        // Serial.printf("httpd_ws_recv_frame failed to get frame len with %d\n", ret);
         return ret;
     }
-    // Serial.printf("frame len is %d\n", ws_pkt.len);
     if (ws_pkt.len) {
         /* ws_pkt.len + 1 is for NULL termination as we are expecting a string */
         buf = (uint8_t*)calloc(1, ws_pkt.len + 1);
         if (buf == NULL) {
-            // Serial.printf("Failed to calloc memory for buf\n");
             return ESP_ERR_NO_MEM;
         }
         ws_pkt.payload = buf;
@@ -378,9 +326,7 @@ static esp_err_t echo_handler(httpd_req_t *req)
             free(buf);
             return ret;
         }
-        // Serial.printf("Got packet with message: %s\n", ws_pkt.payload);
     }
-    // Serial.printf("Packet type: %d\n", ws_pkt.type);
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
         strcmp((char*)ws_pkt.payload,"Trigger async") == 0) {
         free(buf);
@@ -388,29 +334,52 @@ static esp_err_t echo_handler(httpd_req_t *req)
     }
 
     ret = httpd_ws_send_frame(req, &ws_pkt);
-    if (ret != ESP_OK) {
-        // Serial.printf("httpd_ws_send_frame failed with %d\n", ret);
-    }
     free(buf);
     return ret;
 }
 
-//implement messagebuffer freertos send and recive example
-#include "freertos/message_buffer.h"
 
-static MessageBufferHandle_t wsMeassageBufferHandle = NULL;
 
+/**
+ * @brief Broadcasts a binary message to all connected websocket clients.
+ *
+ * This function sends a binary message to all connected websocket clients.
+ * It first checks if the device is connected to a WiFi network. If not,
+ * this function returns without doing anything.
+ *
+ * If the device is connected to WiFi, this function sends the binary
+ * message to the message buffer using `xMessageBufferSend`.
+ *
+ * @param data Pointer to the binary message to be sent.
+ * @param len Length of the binary message.
+ *
+ * @return void
+ *
+ * @throws None
+ */
 void ws_broadcast(uint8_t *data, size_t len) {
-    // Serial.printf("Broadcasting %d bytes. Buffer available: %d\n", len, xMessageBufferSpacesAvailable(wsMeassageBufferHandle));
     if (xMessageBufferSend(wsMeassageBufferHandle, data, len, 500 / portTICK_PERIOD_MS) == pdFALSE) {
         ESP_LOGE(TAG_HTTP, "Failed to send data to message buffer");
     }
 }
 
-int count = 0;
 
-#include "WiFi.h"
-
+/**
+ * @brief Broadcasts a binary message to all connected websocket clients.
+ *
+ * This function sends a binary message to all connected websocket clients.
+ * It first checks if the device is connected to a WiFi network. If not,
+ * this function returns without doing anything.
+ *
+ * If the device is connected to WiFi, this function retrieves the list of
+ * connected clients and sends a binary message to each client. The binary
+ * message is sent asynchronously using `httpd_ws_send_frame_async()`.
+ *
+ * @param buf Pointer to the buffer containing the binary message.
+ * @param len Length of the binary message.
+ *
+ * @return void
+ */
 static void ws_broadcast_buf( uint8_t *buf, size_t len) {
     if (WiFi.status() != WL_CONNECTED) {
       ESP_LOGE(TAG_HTTP, "ws_broadcast_buf: Not connected to WiFi");
@@ -422,16 +391,11 @@ static void ws_broadcast_buf( uint8_t *buf, size_t len) {
     httpd_ws_frame_t ws_pkt;
     
     if (httpd_get_client_list(server, &clients, client_fds) == ESP_OK) {
-      // Serial.printf("Active clients: %d\n", clients);
       for (size_t i=0; i < clients; ++i) {
         int sock = client_fds[i];
         if (httpd_ws_get_fd_info(server, sock) == HTTPD_WS_CLIENT_WEBSOCKET) {
-            // Serial.printf("Active client (fd=%d) -> sending async message (length: %d)\n", sock, len);
             ESP_LOGD(TAG_HTTP, "Active client (fd=%d) -> sending async message (length: %d)\n", sock, len);
-            // send meassge syncronously
-            // httpd_ws_send_data(*server, sock, "Trigger async", HTTPD_WS_TYPE_TEXT);
 
-            // struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
             struct async_resp_arg *resp_arg = new async_resp_arg;
             resp_arg->hd = server;
             resp_arg->fd = sock;
@@ -443,15 +407,7 @@ static void ws_broadcast_buf( uint8_t *buf, size_t len) {
             if (httpd_ws_send_frame_async(resp_arg->hd, resp_arg->fd, &ws_pkt) != ESP_OK) {
                 ESP_LOGE(TAG_HTTP, "httpd_ws_send_frame_async failed!");
             }
-            // Serial.printf("httpd_ws_send_frame_async done FD=%d!\n", resp_arg->fd);
-            // httpd_ws_send_frame_async(resp_arg->hd, resp_arg->fd, &ws_pkt);
-            // free(resp_arg);
             vTaskDelay(5 / portTICK_PERIOD_MS);
-            // if (httpd_queue_work(resp_arg->hd, send_hello, resp_arg) != ESP_OK) {
-            //     Serial.printf("httpd_queue_work failed!\n");
-            //     send_messages = false;
-            //     break;
-            // }
         }
       }
     } else {
@@ -460,39 +416,40 @@ static void ws_broadcast_buf( uint8_t *buf, size_t len) {
     }
 }
 
+/**
+ * @brief Task that receives message buffer messages and broadcasts
+ * them to all websocket clients.
+ *
+ * This task is created by `start_webserver()` and is responsible for
+ * receiving messages from the message buffer and sending them to all
+ * connected websocket clients.
+ *
+ * @param pvParameters Pointer to `httpd_handle_t*` server handle.
+ */
 static void ws_broadcast_task(void *pvParameters)
 {
     httpd_handle_t* server = (httpd_handle_t*)pvParameters;
 
-
-
-
     wsMeassageBufferHandle = xMessageBufferCreate(512 * 6);
     assert(wsMeassageBufferHandle != NULL);
-
 
     char data[512*4];
     size_t len = 512*4;
     while (1) {
         size_t len_out = xMessageBufferReceive(wsMeassageBufferHandle, data, len, portMAX_DELAY);
         if (len_out > 0) {
-            // Serial.printf("xMessageBufferReceive len_out: %d\n", len_out);
             ws_broadcast_buf((uint8_t *)data, len_out);
         } else {
-            // Serial.printf("xMessageBufferReceive failed\n");
             ESP_LOGE(TAG_HTTP, "xMessageBufferReceive failed");
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
-        // vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
 
 
-
 void start_webserver()
 {
-  // testQueueConsumer();
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.stack_size = 1024 * 10;
   config.lru_purge_enable = true;
@@ -508,9 +465,7 @@ void start_webserver()
     });
     
     register_uri_handler(server, "/pump_config", HTTP_POST, pump_config_post_handler);
-    register_uri_handler(server, "/events", HTTP_GET, sse_handler);
 
-    // initWSServer(&server);
     static const httpd_uri_t ws = {
       .uri        = "/ws",
       .method     = HTTP_GET,
@@ -532,11 +487,7 @@ void start_webserver()
 
     register_uri_handler(server, "/*", HTTP_GET, rest_common_get_handler);
 
-
     ESP_LOGD(TAG_HTTP, "HTTP server started at port %d", config.server_port);
-    // return server;
   }
-
-  // return NULL;
 }
 
